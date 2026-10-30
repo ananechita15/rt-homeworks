@@ -1,10 +1,10 @@
 package ssatr.service;
 
 /**
- * SetÄrile aplicaČ›iei Č™i numele topic-urilor MQTT.
+ * Setările aplicației și numele topic-urilor MQTT.
  *
- * Brokerul este partajat de toČ›i studenČ›ii. ĂŽnlocuiČ›i STUDENT cu numele vostru
- * (fÄrÄ spaČ›ii sau diacritice), identic Ă®n ambele aplicaČ›ii.
+ * Brokerul este partajat de toți studenții. Înlocuiți STUDENT cu numele vostru
+ * (fără spații sau diacritice), identic în ambele aplicații.
  */
 public class Config {
 
@@ -24,12 +24,12 @@ public class Config {
         return DEVICES + deviceId + "/alarm";
     }
 
-    /** comenzi de la business service cÄtre device: "SET_INTERVAL 2000" etc. */
+    /** comenzi de la business service către device: "SET_INTERVAL 2000" etc. */
     public static String commandTopic(String deviceId) {
         return DEVICES + deviceId + "/commands";
     }
 
-    /** confirmÄri trimise de device dupÄ executarea unei comenzi: "deviceId;timestamp;text" */
+    /** confirmări trimise de device după executarea unei comenzi: "deviceId;timestamp;text" */
     public static String statusTopic(String deviceId) {
         return DEVICES + deviceId + "/status";
     }
