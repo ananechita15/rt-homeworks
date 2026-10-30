@@ -1,87 +1,224 @@
 // Device-ul IoT din tema 01, de data aceasta pe un ESP32-C3 Super Mini.
 //
-// Aceeași logică și același protocol ca device-simulator din tema 01, cu trei
-// taskuri FreeRTOS în loc de trei thread-uri Java:
-//
 //   task periodic --(coada de alarme)--> task sporadic
 //        |                                     |
 //        +---- telemetry ---> MQTT <--- alarm -+
 //                              |
 //                          commands --> command_received() --(coada de comenzi)--> task aperiodic ---> status
 //
-// Gata implementate (nu trebuie modificate):
-//   config.h         setările: Wi-Fi, broker, STUDENT, valorile inițiale; DEVICE_ID
-//                    se citește din adresa MAC a plăcii
-//   connection.h/cpp Wi-Fi, ora exactă (SNTP), clientul MQTT, mqtt_publish(), epoch_ms()
-//
-// Așa cum este, schița se conectează la Wi-Fi și la broker și afișează pe
-// Serial comenzile primite. Taskurile le scrieți voi: TODO 0 ... TODO 3.
-// Exemplele de pornire sunt în laboratorul 0 din rt-labs-esp32c3; vezi
-// exemple/README.md din folderul temei.
-//
 // Placa: ESP32C3 Dev Module, USB CDC On Boot: Enabled. Serial Monitor: 115200 baud.
+
+#include <ctype.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
 
 #include "config.h"
 #include "connection.h"
 
 // Temperatura cipului, în °C, de la senzorul intern al ESP32-C3.
-// Este temperatura siliciului, nu a camerei: imediat după pornirea Wi-Fi-ului
-// poate fi în jur de 50 °C, apoi scade în câteva minute spre 35-40 °C.
-// Rezoluția este de aproximativ 1 °C. Ca să provocați alarme, puneți pragul
-// cu SET_THRESHOLD cu un grad sub valoarea citită.
 float read_temperature(void) {
     return temperatureRead();
 }
 
-// TODO 1: TASK PERIODIC, cu perioada T (inițial PERIOD_MS_INITIAL).
-//   Fiecare job:
-//   - citește temperatura: read_temperature()
-//   - publică telemetria: mqtt_publish("telemetry", "deviceId;timestamp;temperatura")
-//     (timestamp = epoch_ms(), tipărit cu %lld; temperatura cu "%.2f")
-//   - dacă temperatura depășește pragul (inițial THRESHOLD_INITIAL), pune
-//     un eveniment în coada de alarme, fără să se blocheze (timeout 0).
-//     Taskul periodic NU tratează alarma: o tratează taskul sporadic.
-//   Eliberările respectă grila r_k = r_0 + kT: folosiți așteptare absolută
-//   (xTaskDelayUntil), nu relativă (delay, vTaskDelay), ca să nu apară derivă.
-//   Perioada și pragul se schimbă prin comenzi (taskul aperiodic), deci sunt
-//   variabile globale volatile, citite la fiecare job.
+// ---- parametrii taskului periodic ----
+// volatile: sunt citiți de taskul periodic și modificați de taskul aperiodic
+static volatile uint32_t g_period_ms = PERIOD_MS_INITIAL;
+static volatile float g_threshold = THRESHOLD_INITIAL;
 
-// TODO 2: TASK SPORADIC, tratează alarmele de temperatură.
-//   - așteaptă un eveniment din coada de alarme
-//   - dacă de la ultima alarmă publicată au trecut mai puțin de
-//     MIN_INTERARRIVAL_MS, respinge evenimentul (afișați un mesaj pe Serial)
-//   - altfel publică: mqtt_publish("alarm", "deviceId;timestamp;temperatura;prag")
-//   Pentru intervale folosiți un timp monoton, millis(), nu epoch_ms().
+// ---- prioritățile taskurilor (între 2 și 19) ----
+// periodic = cea mai mare (termene hard), sporadic = mijloc, aperiodic = cea mai mică (soft)
+static const UBaseType_t PRIO_PERIODIC = 5;
+static const UBaseType_t PRIO_SPORADIC = 4;
+static const UBaseType_t PRIO_APERIODIC = 3;
+static const uint32_t TASK_STACK = 4096;  // în octeți
 
-// TODO 3: TASK APERIODIC, execută comenzile primite de la business service.
-//   Comenzile ajung în command_received() (mai jos), care le pune în coada de
-//   comenzi; fiecare comandă eliberează un job al taskului:
-//     SET_INTERVAL <ms>       schimbă perioada T a taskului periodic
-//     SET_THRESHOLD <valoare> schimbă pragul de alarmă
-//     RESET                   readuce perioada și pragul la valorile inițiale
-//     STATUS                  raportează perioada și pragul curente
-//   După fiecare comandă publică o confirmare:
-//     mqtt_publish("status", "deviceId;timestamp;OK SET_INTERVAL 1000")
-//   O comandă necunoscută sau un parametru invalid nu oprește taskul: se
-//   publică "ERROR <motiv>".
+// ---- elementele cozilor (se copiază prin valoare) ----
+struct AlarmEvent {
+    float temperature;
+    float threshold;
+};
+
+struct Command {
+    char text[COMMAND_MAX_LEN];
+};
+
+static QueueHandle_t g_alarm_queue = NULL;
+static QueueHandle_t g_command_queue = NULL;
+
+// ======================================================================
+// TODO 1: TASK PERIODIC
+// ======================================================================
+static void periodic_task(void* arg) {
+    (void)arg;
+    TickType_t last = xTaskGetTickCount();  // eliberarea jobului curent pe grilă
+
+    for (;;) {
+        // ---- începutul jobului ----
+        float t = read_temperature();
+        float threshold = g_threshold;
+
+        char payload[96];
+        snprintf(payload, sizeof(payload), "%s;%lld;%.2f", DEVICE_ID, (long long)epoch_ms(), t);
+        mqtt_publish("telemetry", payload);
+        Serial.printf("[periodic] %s\n", payload);
+
+        if (t > threshold) {
+            AlarmEvent ev = {t, threshold};
+            xQueueSend(g_alarm_queue, &ev, 0);  // timeout 0: nu blocăm taskul periodic
+        }
+        // ---- sfârșitul jobului ----
+
+        // așteptare ABSOLUTĂ: următoarea eliberare = last + T, fără derivă
+        TickType_t period = pdMS_TO_TICKS(g_period_ms);
+        if (period == 0) period = 1;
+        xTaskDelayUntil(&last, period);
+    }
+}
+
+// ======================================================================
+// TODO 2: TASK SPORADIC
+// ======================================================================
+static void sporadic_task(void* arg) {
+    (void)arg;
+    bool have_last = false;
+    uint32_t last_release = 0;  // millis() la ultima alarmă publicată
+
+    for (;;) {
+        AlarmEvent ev;
+        xQueueReceive(g_alarm_queue, &ev, portMAX_DELAY);  // așteaptă un eveniment
+
+        uint32_t now = millis();  // timp monoton
+
+        // interval minim între sosiri: evenimentele prea dese sunt respinse
+        if (have_last && (uint32_t)(now - last_release) < MIN_INTERARRIVAL_MS) {
+            Serial.printf("[sporadic] eveniment RESPINS (interval minim neatins): %.2f\n", ev.temperature);
+            continue;
+        }
+
+        last_release = now;  // eliberarea acestui job
+        have_last = true;
+
+        char payload[96];
+        snprintf(payload, sizeof(payload), "%s;%lld;%.2f;%.2f", DEVICE_ID, (long long)epoch_ms(),
+                 ev.temperature, ev.threshold);
+        mqtt_publish("alarm", payload);
+        Serial.printf("[sporadic] ALARMA publicată: %s\n", payload);
+    }
+}
+
+// ======================================================================
+// TODO 3: TASK APERIODIC
+// ======================================================================
+
+// scoate spațiile de la început și de la sfârșit (modifică șirul pe loc)
+static char* trim(char* s) {
+    while (*s && isspace((unsigned char)*s)) s++;
+    char* end = s + strlen(s);
+    while (end > s && isspace((unsigned char)end[-1])) end--;
+    *end = '\0';
+    return s;
+}
+
+// Execută o comandă și scrie în reply răspunsul ("OK ..." sau "ERROR ...").
+static void execute_command(const char* raw, char* reply, size_t size) {
+    char buf[COMMAND_MAX_LEN];
+    strncpy(buf, raw, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+    for (char* p = buf; *p; p++) {
+        if (*p == ';') *p = ',';  // ';' ar strica formatul mesajului de status
+    }
+
+    char* text = trim(buf);
+    if (*text == '\0') {
+        snprintf(reply, size, "ERROR comanda goala");
+        return;
+    }
+
+    // despărțim numele comenzii de parametru
+    char* arg = text;
+    while (*arg && !isspace((unsigned char)*arg)) arg++;
+    if (*arg) {
+        *arg = '\0';
+        arg = trim(arg + 1);
+    }
+
+    if (strcasecmp(text, "SET_INTERVAL") == 0) {
+        if (*arg == '\0') {
+            snprintf(reply, size, "ERROR SET_INTERVAL necesita un parametru: SET_INTERVAL <ms>");
+            return;
+        }
+        char* end;
+        long ms = strtol(arg, &end, 10);
+        if (*end != '\0') {
+            snprintf(reply, size, "ERROR parametru invalid: %s", arg);
+        } else if (ms <= 0) {
+            snprintf(reply, size, "ERROR intervalul trebuie sa fie pozitiv");
+        } else {
+            g_period_ms = (uint32_t)ms;
+            snprintf(reply, size, "OK SET_INTERVAL %ld", ms);
+        }
+    } else if (strcasecmp(text, "SET_THRESHOLD") == 0) {
+        if (*arg == '\0') {
+            snprintf(reply, size, "ERROR SET_THRESHOLD necesita un parametru: SET_THRESHOLD <valoare>");
+            return;
+        }
+        char* end;
+        float value = strtof(arg, &end);
+        if (*end != '\0') {
+            snprintf(reply, size, "ERROR parametru invalid: %s", arg);
+        } else {
+            g_threshold = value;
+            snprintf(reply, size, "OK SET_THRESHOLD %.2f", value);
+        }
+    } else if (strcasecmp(text, "RESET") == 0) {
+        g_period_ms = PERIOD_MS_INITIAL;
+        g_threshold = THRESHOLD_INITIAL;
+        snprintf(reply, size, "OK RESET");
+    } else if (strcasecmp(text, "STATUS") == 0) {
+        snprintf(reply, size, "OK STATUS interval=%lu threshold=%.2f", (unsigned long)g_period_ms,
+                 (double)g_threshold);
+    } else {
+        snprintf(reply, size, "ERROR comanda necunoscuta: %s", text);
+    }
+}
+
+static void aperiodic_task(void* arg) {
+    (void)arg;
+    for (;;) {
+        Command cmd;
+        xQueueReceive(g_command_queue, &cmd, portMAX_DELAY);  // în ordinea sosirii
+
+        // jobul: execută comanda (o comandă greșită dă ERROR, nu oprește taskul)
+        char reply[128];
+        execute_command(cmd.text, reply, sizeof(reply));
+
+        char payload[192];
+        snprintf(payload, sizeof(payload), "%s;%lld;%s", DEVICE_ID, (long long)epoch_ms(), reply);
+        mqtt_publish("status", payload);
+        Serial.printf("[aperiodic] %s -> %s\n", cmd.text, reply);
+    }
+}
 
 // Apelată de clientul MQTT pentru fiecare comandă primită (vezi connection.h).
+// Rulează pe taskul clientului MQTT: doar punem comanda în coadă.
 void command_received(const char* text) {
     Serial.printf("[mqtt] comandă primită: %s\n", text);
-    // TODO 3: puneți comanda în coada de comenzi, fără să vă blocați
-    //   (timeout 0). text este valid doar în timpul acestui apel: elementul
-    //   cozii trebuie să conțină textul însuși (de exemplu un struct cu
-    //   char text[COMMAND_MAX_LEN]), nu un pointer.
+
+    Command cmd;
+    strncpy(cmd.text, text, COMMAND_MAX_LEN - 1);  // copiem textul: nu rămâne valid după apel
+    cmd.text[COMMAND_MAX_LEN - 1] = '\0';
+
+    if (g_command_queue == NULL || xQueueSend(g_command_queue, &cmd, 0) != pdTRUE) {
+        Serial.println("[mqtt] coada de comenzi plină, comandă pierdută");
+    }
 }
 
 void setup() {
     Serial.begin(115200);
-    // Fără așteptare la scriere: cu placa la USB, dar fără Serial Monitor deschis,
-    // fiecare Serial.printf() ar aștepta până la 2 s să fie citit și ar întârzia
-    // taskul care scrie. Așa, textul pe care nu-l citește nimeni se pierde.
     Serial.setTxTimeoutMs(0);
     uint32_t t = millis();
-    while (!Serial && millis() - t < 3000) delay(10);  // așteptăm Serial Monitor, cel mult 3 s
+    while (!Serial && millis() - t < 3000) delay(10);
     delay(200);
     Serial.println();
     Serial.printf("=== tema 02: STUDENT %s, DEVICE_ID %s ===\n", STUDENT, DEVICE_ID);
@@ -89,16 +226,16 @@ void setup() {
     wifi_connect();
     time_sync();
 
-    // TODO 0 (a): creați cele două cozi (xQueueCreate): coada de alarme și
-    //   coada de comenzi. Înainte de mqtt_start(): de acolo încolo pot sosi
-    //   comenzi, iar command_received() le pune în coada de comenzi.
+    // TODO 0 (a): cozile, înainte de mqtt_start()
+    g_alarm_queue = xQueueCreate(10, sizeof(AlarmEvent));
+    g_command_queue = xQueueCreate(8, sizeof(Command));
 
     mqtt_start();
 
-    // TODO 0 (b): porniți cele trei taskuri (xTaskCreate). După mqtt_start(),
-    //   ca primele mesaje publicate să nu se piardă. Alegeți prioritățile
-    //   între 2 și 19: peste loopTask (1), sub taskurile sistemului pentru
-    //   evenimente și Wi-Fi (20, 23). Stiva, în octeți: cel puțin 4096.
+    // TODO 0 (b): taskurile, după mqtt_start()
+    xTaskCreate(periodic_task, "periodic", TASK_STACK, NULL, PRIO_PERIODIC, NULL);
+    xTaskCreate(sporadic_task, "sporadic", TASK_STACK, NULL, PRIO_SPORADIC, NULL);
+    xTaskCreate(aperiodic_task, "aperiodic", TASK_STACK, NULL, PRIO_APERIODIC, NULL);
 }
 
 void loop() {
