@@ -63,7 +63,16 @@ class ApiClient {
                         so.get("lat").getAsDouble(),
                         so.get("lon").getAsDouble()));
             }
-            result.add(new Model.Direction(text(o, "trip_id"), text(o, "headsign"), stops));
+            // traseul: lista de puncte [lat, lon], in ordinea parcurgerii
+            List<double[]> shape = new ArrayList<>();
+            JsonElement shapeElement = o.get("shape");
+            if (shapeElement != null && shapeElement.isJsonArray()) {
+                for (JsonElement p : shapeElement.getAsJsonArray()) {
+                    JsonArray point = p.getAsJsonArray();
+                    shape.add(new double[] {point.get(0).getAsDouble(), point.get(1).getAsDouble()});
+                }
+            }
+            result.add(new Model.Direction(text(o, "trip_id"), text(o, "headsign"), stops, shape));
         }
         return result;
     }

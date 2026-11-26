@@ -9,7 +9,8 @@ final class Model {
 
     record Stop(int id, String name, double lat, double lon) { }
 
-    record Direction(String tripId, String headsign, List<Stop> stops) { }
+    /** Un sens al liniei: statiile in ordinea parcurgerii si traseul (shape) ca puncte {lat, lon}. */
+    record Direction(String tripId, String headsign, List<Stop> stops, List<double[]> shape) { }
 
     /** O pozitie raportata de un vehicul. routeId e -1 si tripId e "" daca lipsesc din mesaj. */
     record Vehicle(int id, String label, int routeId, String tripId,
