@@ -3,11 +3,12 @@ package ssatr.tracker;
 import java.util.List;
 import java.util.Optional;
 import java.util.Scanner;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
-/** Alege linia/sensul/statia (API REST), apoi urmareste vehiculele pe RabbitMQ. */
+/** Alege linia/sensul/statia (API REST), urmareste vehiculele (RabbitMQ) si vorbeste cu placa (MQTT). */
 public class TrackerApp {
 
     public static void main(String[] args) throws Exception {
@@ -25,27 +26,52 @@ public class TrackerApp {
                 + " (id " + stop.id() + ", " + stop.lat() + ", " + stop.lon() + ")");
 
         NearestBus nearest = new NearestBus(line, direction, stop);
-        ScheduledExecutorService printer = Executors.newSingleThreadScheduledExecutor();
+        CountDownLatch finished = new CountDownLatch(1);          // se opreste la BOARDED sau la Enter
+        ScheduledExecutorService sender = Executors.newSingleThreadScheduledExecutor();
 
-        try (VehicleListener listener = new VehicleListener(nearest::onVehicle)) {
-            // la fiecare 5 secunde: un singur rand cu cel mai apropiat autobuz
-            printer.scheduleAtFixedRate(() -> printNearest(nearest, stop), 5, 5, TimeUnit.SECONDS);
-            System.out.println("Ascult pozitiile vehiculelor pe RabbitMQ. Apasa Enter pentru oprire.");
-            in.nextLine();
+        try (BoardLink board = new BoardLink(() -> {
+            System.out.println(">>> Te-ai urcat in autobuz (BOOT apasat pe placa). Gata!");
+            finished.countDown();
+        });
+             VehicleListener listener = new VehicleListener(nearest::onVehicle)) {
+
+            // la fiecare 5 secunde: afisam si trimitem placii cel mai apropiat autobuz
+            sender.scheduleAtFixedRate(() -> report(nearest, stop, board), 5, 5, TimeUnit.SECONDS);
+
+            System.out.println("Urmaresc autobuzul. Apasa Enter pentru oprire sau BOOT pe placa cand urci.");
+            Thread enterWatcher = new Thread(() -> {
+                in.nextLine();
+                finished.countDown();
+            });
+            enterWatcher.setDaemon(true);
+            enterWatcher.start();
+            finished.await();
         } finally {
-            printer.shutdownNow();
+            sender.shutdownNow();
         }
     }
 
-    private static void printNearest(NearestBus nearest, Model.Stop stop) {
+    private static void report(NearestBus nearest, Model.Stop stop, BoardLink board) {
+        try {
+            doReport(nearest, stop, board);
+        } catch (RuntimeException e) {
+            // o exceptie ar opri definitiv executarea periodica; o afisam si continuam
+            System.err.println("[raport] eroare: " + e);
+        }
+    }
+
+    private static void doReport(NearestBus nearest, Model.Stop stop, BoardLink board) {
         Optional<NearestBus.Result> best = nearest.nearest();
         if (best.isEmpty()) {
             System.out.println("Inca nu stiu niciun autobuz pe aceasta linie.");
+            board.sendNoBus();
             return;
         }
         NearestBus.Result r = best.get();
-        System.out.printf("Cel mai apropiat: vehicul %s, %.0f m de statia %s (din %d vehicule cunoscute)%n",
-                r.vehicle().label(), r.meters(), stop.name(), nearest.knownVehicles());
+        long meters = Math.round(r.meters());
+        System.out.printf("Cel mai apropiat: vehicul %s, %d m de statia %s (din %d vehicule cunoscute)%n",
+                r.vehicle().label(), meters, stop.name(), nearest.knownVehicles());
+        board.sendDistance(meters);
     }
 
     private static Model.Line chooseLine(List<Model.Line> lines, Scanner in) {
